@@ -9,8 +9,8 @@ import (
 	"sync"
 	"time"
 
-	"botty/internal/clickup"
-	"botty/internal/sprint"
+	"clickdown/internal/clickup"
+	"clickdown/internal/sprint"
 )
 
 type SprintResolver interface {
@@ -19,6 +19,12 @@ type SprintResolver interface {
 
 type TaskSource interface {
 	GetListTasks(ctx context.Context, listID string) ([]clickup.Task, error)
+}
+
+type CacheCapture interface {
+	BeginCacheCapture()
+	CommitCacheCapture()
+	AbortCacheCapture()
 }
 
 type Loader interface {
@@ -37,6 +43,19 @@ func NewService(resolver SprintResolver, source TaskSource, anchor string) *Serv
 }
 
 func (s *Service) Load(ctx context.Context) (Snapshot, error) {
+	capture, capturesCache := s.source.(CacheCapture)
+	committed := false
+	if capturesCache {
+		capture.BeginCacheCapture()
+		defer func() {
+			if committed {
+				capture.CommitCacheCapture()
+			} else {
+				capture.AbortCacheCapture()
+			}
+		}()
+	}
+
 	sprints, err := s.resolver.Resolve(ctx, s.anchor, 2)
 	if err != nil {
 		return Snapshot{}, err
@@ -103,12 +122,14 @@ func (s *Service) Load(ctx context.Context) (Snapshot, error) {
 	for _, id := range order {
 		mapped = append(mapped, byID[id])
 	}
-	return Snapshot{
+	snapshot := Snapshot{
 		Sprints:  sprints,
 		Forest:   BuildForest(mapped),
 		Warnings: warnings,
 		LoadedAt: s.now(),
-	}, nil
+	}
+	committed = true
+	return snapshot, nil
 }
 
 func mapTask(raw clickup.Task, sprintName string) Task {

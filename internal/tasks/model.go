@@ -5,7 +5,7 @@ import (
 	"strings"
 	"time"
 
-	"botty/internal/sprint"
+	"clickdown/internal/sprint"
 )
 
 type Status struct {

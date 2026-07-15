@@ -2,14 +2,17 @@ package tui
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"fmt"
+	"io"
 	"strings"
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
 
-	"botty/internal/browser"
-	"botty/internal/tasks"
+	"clickdown/internal/browser"
+	"clickdown/internal/tasks"
 )
 
 type loadMsg struct {
@@ -19,6 +22,22 @@ type loadMsg struct {
 
 type openMsg struct {
 	err error
+}
+
+type cacheSnapshotMsg struct {
+	snapshot tasks.Snapshot
+}
+
+type manualRefreshMsg struct {
+	snapshot tasks.Snapshot
+	changed  bool
+	err      error
+}
+
+type watchStoppedMsg struct{}
+
+type CacheRefresher interface {
+	RefreshActive(ctx context.Context) (bool, error)
 }
 
 type lineKind int
@@ -39,6 +58,7 @@ type displayLine struct {
 type Model struct {
 	loader        tasks.Loader
 	opener        browser.Opener
+	refresher     CacheRefresher
 	includeClosed bool
 	snapshot      tasks.Snapshot
 	lines         []displayLine
@@ -54,13 +74,16 @@ type Model struct {
 	notice        string
 	ctx           context.Context
 	cancel        context.CancelFunc
+	watchCancel   context.CancelFunc
+	refreshEvery  time.Duration
 }
 
-func NewModel(loader tasks.Loader, opener browser.Opener, includeClosed bool) *Model {
+func NewModel(loader tasks.Loader, opener browser.Opener, includeClosed bool, refresher CacheRefresher) *Model {
 	ctx, cancel := context.WithCancel(context.Background())
 	return &Model{
 		loader:        loader,
 		opener:        opener,
+		refresher:     refresher,
 		includeClosed: includeClosed,
 		expanded:      make(map[string]bool),
 		nodes:         make(map[string]*tasks.Node),
@@ -70,6 +93,7 @@ func NewModel(loader tasks.Loader, opener browser.Opener, includeClosed bool) *M
 		loading:       true,
 		ctx:           ctx,
 		cancel:        cancel,
+		refreshEvery:  20 * time.Second,
 	}
 }
 
@@ -91,7 +115,30 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		if message.err == nil {
 			m.snapshot = message.snapshot
 			m.rebuild()
+			return m, m.startCacheWatch(true)
 		}
+		return m, nil
+	case cacheSnapshotMsg:
+		m.snapshot = message.snapshot
+		m.err = nil
+		m.notice = ""
+		m.rebuild()
+		return m, m.startCacheWatch(false)
+	case manualRefreshMsg:
+		if message.changed {
+			m.snapshot = message.snapshot
+			m.err = nil
+			m.rebuild()
+		}
+		if message.err != nil {
+			m.notice = "Cache parcial: " + message.err.Error()
+		} else if message.changed {
+			m.notice = "Datos actualizados"
+		} else {
+			m.notice = "Sin cambios"
+		}
+		return m, m.startCacheWatch(false)
+	case watchStoppedMsg:
 		return m, nil
 	case openMsg:
 		if message.err != nil {
@@ -100,8 +147,34 @@ func (m *Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.notice = "Tarea abierta en navegador"
 		}
 		return m, nil
+	case tea.MouseMsg:
+		return m.handleMouse(tea.MouseEvent(message))
 	case tea.KeyMsg:
 		return m.handleKey(message)
+	}
+	return m, nil
+}
+
+func (m *Model) handleMouse(mouse tea.MouseEvent) (tea.Model, tea.Cmd) {
+	if mouse.Button == tea.MouseButtonWheelUp {
+		m.move(-3)
+		return m, nil
+	}
+	if mouse.Button == tea.MouseButtonWheelDown {
+		m.move(3)
+		return m, nil
+	}
+	if mouse.Action != tea.MouseActionMotion && mouse.Action != tea.MouseActionPress {
+		return m, nil
+	}
+	lineIndex := mouse.Y - 3 + m.offset
+	if lineIndex < 0 || lineIndex >= len(m.lines) {
+		return m, nil
+	}
+	line := m.lines[lineIndex]
+	if line.kind == taskLine {
+		m.selectedID = line.node.Task.ID
+		m.ensureVisible()
 	}
 	return m, nil
 }
@@ -112,11 +185,10 @@ func (m *Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.cancel()
 		return m, tea.Quit
 	case "r":
-		if !m.loading {
-			m.loading = true
-			m.err = nil
-			m.notice = ""
-			return m, m.loadCmd()
+		if !m.loading && m.refresher != nil {
+			m.stopCacheWatch()
+			m.notice = "Actualizando cache…"
+			return m, m.manualRefreshCmd()
 		}
 	}
 	if m.loading || m.err != nil {
@@ -178,6 +250,117 @@ func (m *Model) openCmd(taskURL string) tea.Cmd {
 	return func() tea.Msg {
 		return openMsg{err: m.opener.Open(taskURL)}
 	}
+}
+
+func (m *Model) startCacheWatch(immediate bool) tea.Cmd {
+	if m.refresher == nil {
+		return nil
+	}
+	m.stopCacheWatch()
+	ctx, cancel := context.WithCancel(m.ctx)
+	m.watchCancel = cancel
+	signature := snapshotSignature(m.snapshot)
+	return func() tea.Msg {
+		dirty := false
+		if !immediate && !waitContext(ctx, m.refreshEvery) {
+			return watchStoppedMsg{}
+		}
+		for {
+			changed, _ := m.refresher.RefreshActive(ctx)
+			dirty = dirty || changed
+			if ctx.Err() != nil {
+				return watchStoppedMsg{}
+			}
+			if dirty {
+				snapshot, err := m.loader.Load(ctx)
+				if err == nil {
+					dirty = false
+					if snapshotSignature(snapshot) != signature {
+						return cacheSnapshotMsg{snapshot: snapshot}
+					}
+				}
+			}
+			if !waitContext(ctx, m.refreshEvery) {
+				return watchStoppedMsg{}
+			}
+		}
+	}
+}
+
+func (m *Model) stopCacheWatch() {
+	if m.watchCancel != nil {
+		m.watchCancel()
+		m.watchCancel = nil
+	}
+}
+
+func (m *Model) manualRefreshCmd() tea.Cmd {
+	return func() tea.Msg {
+		ctx, cancel := context.WithTimeout(m.ctx, 60*time.Second)
+		defer cancel()
+		changed, refreshErr := m.refresher.RefreshActive(ctx)
+		if !changed {
+			return manualRefreshMsg{err: refreshErr}
+		}
+		snapshot, loadErr := m.loader.Load(ctx)
+		return manualRefreshMsg{
+			snapshot: snapshot,
+			changed:  loadErr == nil && snapshotSignature(snapshot) != snapshotSignature(m.snapshot),
+			err:      errorsJoin(refreshErr, loadErr),
+		}
+	}
+}
+
+func waitContext(ctx context.Context, duration time.Duration) bool {
+	timer := time.NewTimer(duration)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+func snapshotSignature(snapshot tasks.Snapshot) string {
+	hash := sha256.New()
+	for _, warning := range snapshot.Warnings {
+		_, _ = io.WriteString(hash, "warning\x00"+warning.Error()+"\x00")
+	}
+	var writeNode func(*tasks.Node)
+	writeNode = func(node *tasks.Node) {
+		task := node.Task
+		_, _ = fmt.Fprintf(hash, "task\x00%s\x00%s\x00%s\x00%s\x00%s\x00%s\x00%d\x00%t\x00", task.ID, task.Name, task.URL, task.ParentID, task.Status.Name, task.Status.Type, task.Status.OrderIndex, node.Orphan)
+		_, _ = io.WriteString(hash, task.Status.Color+"\x00")
+		if task.Priority != nil {
+			_, _ = fmt.Fprintf(hash, "priority\x00%s\x00%s\x00%s\x00", task.Priority.ID, task.Priority.Name, task.Priority.Color)
+		}
+		_, _ = io.WriteString(hash, strings.Join(task.Assignees, "\x1f")+"\x00")
+		if task.DueDate != nil {
+			_, _ = fmt.Fprintf(hash, "due\x00%d\x00", task.DueDate.UnixMilli())
+		}
+		for _, child := range node.Children {
+			writeNode(child)
+		}
+		_, _ = io.WriteString(hash, "end\x00")
+	}
+	for _, root := range snapshot.Forest {
+		writeNode(root)
+	}
+	return hex.EncodeToString(hash.Sum(nil))
+}
+
+func errorsJoin(values ...error) error {
+	parts := make([]string, 0, len(values))
+	for _, value := range values {
+		if value != nil {
+			parts = append(parts, value.Error())
+		}
+	}
+	if len(parts) == 0 {
+		return nil
+	}
+	return fmt.Errorf("%s", strings.Join(parts, "; "))
 }
 
 func (m *Model) rebuild() {
@@ -287,17 +470,8 @@ func (m *Model) contentHeight() int {
 	return height
 }
 
-func (m *Model) sprintSummary() string {
-	parts := make([]string, 0, len(m.snapshot.Sprints))
-	for _, current := range m.snapshot.Sprints {
-		date := current.EffectiveDate().Format("02/01/2006")
-		parts = append(parts, fmt.Sprintf("%s (%s)", current.Name, date))
-	}
-	return strings.Join(parts, "  ·  ")
-}
-
 func Run(model *Model) error {
-	program := tea.NewProgram(model, tea.WithAltScreen())
+	program := tea.NewProgram(model, tea.WithAltScreen(), tea.WithMouseCellMotion())
 	_, err := program.Run()
 	return err
 }

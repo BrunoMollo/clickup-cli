@@ -7,7 +7,7 @@ import (
 	"testing"
 	"time"
 
-	"botty/internal/clickup"
+	"clickdown/internal/clickup"
 )
 
 type fakeHierarchy struct {

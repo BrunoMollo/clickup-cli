@@ -17,7 +17,7 @@ type Config struct {
 }
 
 func Parse(args []string, getenv func(string) string, stderr io.Writer) (Config, error) {
-	fs := flag.NewFlagSet("botty", flag.ContinueOnError)
+	fs := flag.NewFlagSet("clickdown", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
 	anchorDefault := strings.TrimSpace(getenv("CLICKUP_ANCHOR_VIEW"))
@@ -37,7 +37,7 @@ func Parse(args []string, getenv func(string) string, stderr io.Writer) (Config,
 
 	cfg.Token = strings.TrimSpace(getenv("CLICKUP_API_TOKEN"))
 	if cfg.Token == "" {
-		return Config{}, errors.New("falta CLICKUP_API_TOKEN; exportá tu token personal de ClickUp antes de ejecutar botty")
+		return Config{}, errors.New("falta CLICKUP_API_TOKEN; exportá tu token personal de ClickUp antes de ejecutar clickdown")
 	}
 	cfg.AnchorView = strings.TrimSpace(cfg.AnchorView)
 	if cfg.AnchorView == "" {

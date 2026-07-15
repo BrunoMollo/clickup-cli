@@ -8,6 +8,8 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"clickdown/internal/urlcache"
 )
 
 func TestGetListTasksPaginatesAndSetsParameters(t *testing.T) {
@@ -82,5 +84,49 @@ func TestRequestCancellation(t *testing.T) {
 	_, err := client.GetList(ctx, "1")
 	if err == nil {
 		t.Fatal("se esperaba cancelación")
+	}
+}
+
+func TestClientUsesPersistentCacheAndRefreshesActiveURL(t *testing.T) {
+	var version atomic.Int32
+	version.Store(1)
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(writer http.ResponseWriter, request *http.Request) {
+		calls.Add(1)
+		if version.Load() == 1 {
+			_, _ = writer.Write([]byte(`{"view":{"id":"v1","name":"old","parent":{"id":"1","type":5}}}`))
+			return
+		}
+		_, _ = writer.Write([]byte(`{"view":{"id":"v1","name":"new","parent":{"id":"1","type":5}}}`))
+	}))
+	defer server.Close()
+	store, err := urlcache.New(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	client := NewClientWithOptions("secret", server.URL, server.Client())
+	client.cache = store
+
+	view, err := client.GetView(context.Background(), "v1")
+	if err != nil || view.Name != "old" {
+		t.Fatalf("view=%+v err=%v", view, err)
+	}
+	view, err = client.GetView(context.Background(), "v1")
+	if err != nil || view.Name != "old" || calls.Load() != 1 {
+		t.Fatalf("cache miss: view=%+v calls=%d err=%v", view, calls.Load(), err)
+	}
+
+	version.Store(2)
+	changed, err := client.RefreshActive(context.Background())
+	if err != nil || !changed {
+		t.Fatalf("refresh changed=%t err=%v", changed, err)
+	}
+	view, err = client.GetView(context.Background(), "v1")
+	if err != nil || view.Name != "new" || calls.Load() != 2 {
+		t.Fatalf("cache stale: view=%+v calls=%d err=%v", view, calls.Load(), err)
+	}
+	changed, err = client.RefreshActive(context.Background())
+	if err != nil || changed {
+		t.Fatalf("refresh igual changed=%t err=%v", changed, err)
 	}
 }

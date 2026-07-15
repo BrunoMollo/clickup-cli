@@ -8,9 +8,13 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
+
+	"clickdown/internal/urlcache"
 )
 
 const DefaultBaseURL = "https://api.clickup.com/api/v2"
@@ -20,6 +24,8 @@ type Client struct {
 	token      string
 	httpClient *http.Client
 	maxRetries int
+	cache      *urlcache.Store
+	refreshMu  sync.Mutex
 }
 
 type HTTPError struct {
@@ -37,6 +43,12 @@ func (e *HTTPError) Error() string {
 
 func NewClient(token string) *Client {
 	return NewClientWithOptions(token, DefaultBaseURL, &http.Client{Timeout: 15 * time.Second})
+}
+
+func NewCachedClient(token string, cache *urlcache.Store) *Client {
+	client := NewClient(token)
+	client.cache = cache
+	return client
 }
 
 func NewClientWithOptions(token, baseURL string, httpClient *http.Client) *Client {
@@ -106,36 +118,133 @@ func (c *Client) get(ctx context.Context, path string, query url.Values, target 
 	if len(query) > 0 {
 		endpoint += "?" + query.Encode()
 	}
+	if c.cache != nil {
+		body, hit, err := c.cache.Get(endpoint)
+		if err == nil && hit {
+			if decodeErr := json.Unmarshal(body, target); decodeErr == nil {
+				return nil
+			}
+			c.cache.Delete(endpoint)
+		}
+	}
 
+	body, err := c.fetch(ctx, endpoint)
+	if err != nil {
+		return err
+	}
+	if err := json.Unmarshal(body, target); err != nil {
+		return fmt.Errorf("decodificar respuesta de ClickUp: %w", err)
+	}
+	if c.cache != nil {
+		if _, err := c.cache.Put(endpoint, body); err != nil {
+			return fmt.Errorf("guardar respuesta en cache: %w", err)
+		}
+	}
+	return nil
+}
+
+func (c *Client) RefreshActive(ctx context.Context) (bool, error) {
+	c.refreshMu.Lock()
+	defer c.refreshMu.Unlock()
+	if c.cache == nil {
+		return false, nil
+	}
+	urls := c.cache.ActiveURLs()
+	sort.Strings(urls)
+	if len(urls) == 0 {
+		return false, nil
+	}
+
+	var wait sync.WaitGroup
+	semaphore := make(chan struct{}, 4)
+	var mu sync.Mutex
+	changed := false
+	var failures []error
+	for _, endpoint := range urls {
+		wait.Add(1)
+		go func(endpoint string) {
+			defer wait.Done()
+			select {
+			case semaphore <- struct{}{}:
+				defer func() { <-semaphore }()
+			case <-ctx.Done():
+				mu.Lock()
+				failures = append(failures, ctx.Err())
+				mu.Unlock()
+				return
+			}
+			body, err := c.fetch(ctx, endpoint)
+			if err != nil {
+				mu.Lock()
+				failures = append(failures, err)
+				mu.Unlock()
+				return
+			}
+			entryChanged, err := c.cache.Put(endpoint, body)
+			mu.Lock()
+			defer mu.Unlock()
+			if err != nil {
+				failures = append(failures, err)
+				return
+			}
+			changed = changed || entryChanged
+		}(endpoint)
+	}
+	wait.Wait()
+	return changed, errors.Join(failures...)
+}
+
+func (c *Client) BeginCacheCapture() {
+	if c.cache != nil {
+		c.cache.BeginCapture()
+	}
+}
+
+func (c *Client) CommitCacheCapture() {
+	if c.cache != nil {
+		c.cache.CommitCapture()
+	}
+}
+
+func (c *Client) AbortCacheCapture() {
+	if c.cache != nil {
+		c.cache.AbortCapture()
+	}
+}
+
+func (c *Client) fetch(ctx context.Context, endpoint string) ([]byte, error) {
 	for attempt := 0; ; attempt++ {
 		request, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		request.Header.Set("Authorization", c.token)
 		request.Header.Set("Accept", "application/json")
 
 		response, err := c.httpClient.Do(request)
 		if err != nil {
-			return fmt.Errorf("consultar ClickUp: %w", err)
+			return nil, fmt.Errorf("consultar ClickUp: %w", err)
 		}
 
 		if response.StatusCode >= 200 && response.StatusCode < 300 {
-			defer response.Body.Close()
-			decoder := json.NewDecoder(io.LimitReader(response.Body, 16<<20))
-			if err := decoder.Decode(target); err != nil {
-				return fmt.Errorf("decodificar respuesta de ClickUp: %w", err)
+			body, readErr := io.ReadAll(io.LimitReader(response.Body, 16<<20))
+			response.Body.Close()
+			if readErr != nil {
+				return nil, fmt.Errorf("leer respuesta de ClickUp: %w", readErr)
 			}
-			return nil
+			if !json.Valid(body) {
+				return nil, errors.New("ClickUp devolvió JSON inválido")
+			}
+			return body, nil
 		}
 
 		httpErr := decodeHTTPError(response)
 		response.Body.Close()
 		if attempt >= c.maxRetries || !retryable(response.StatusCode) {
-			return httpErr
+			return nil, httpErr
 		}
 		if err := sleepContext(ctx, retryDelay(response, attempt)); err != nil {
-			return err
+			return nil, err
 		}
 	}
 }

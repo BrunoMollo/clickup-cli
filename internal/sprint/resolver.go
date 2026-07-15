@@ -7,7 +7,7 @@ import (
 	"regexp"
 	"strings"
 
-	"botty/internal/clickup"
+	"clickdown/internal/clickup"
 )
 
 const (

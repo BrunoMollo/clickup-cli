@@ -1,7 +1,7 @@
 .PHONY: build test test-race vet check
 
 build:
-	go build -o bin/botty ./cmd/botty
+	go build -o bin/clickdown ./cmd/clickdown
 
 test:
 	go test ./...

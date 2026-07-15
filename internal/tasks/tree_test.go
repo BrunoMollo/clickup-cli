@@ -41,3 +41,47 @@ func TestGroupForestCombinesStatusCaseInsensitive(t *testing.T) {
 		t.Fatalf("grupos inesperados: %+v", groups)
 	}
 }
+
+func TestGroupForestUsesRequestedWorkflowOrder(t *testing.T) {
+	names := []string{
+		"En refinamiento",
+		"Por hacer",
+		"En curso",
+		"Bloqueado",
+		"En review",
+		"Ready for test",
+		"QA testing",
+		"Esperando release",
+		"Staging",
+		"Esperando deploy",
+		"Producción",
+		"Completado",
+	}
+	tasks := make([]*Task, 0, len(names))
+	for index, name := range names {
+		tasks = append(tasks, &Task{ID: name, Name: name, Status: Status{Name: name, OrderIndex: index}})
+	}
+	groups := GroupForest(BuildForest(tasks))
+	want := []string{
+		"Producción",
+		"Esperando deploy",
+		"Staging",
+		"Esperando release",
+		"QA testing",
+		"Ready for test",
+		"Bloqueado",
+		"En review",
+		"En curso",
+		"Por hacer",
+		"En refinamiento",
+		"Completado",
+	}
+	if len(groups) != len(want) {
+		t.Fatalf("grupos=%d", len(groups))
+	}
+	for index := range want {
+		if groups[index].Status.Name != want[index] {
+			t.Fatalf("posición %d: got %q want %q", index, groups[index].Status.Name, want[index])
+		}
+	}
+}

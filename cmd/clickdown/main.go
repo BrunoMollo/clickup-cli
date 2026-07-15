@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"os"
 
-	"botty/internal/app"
+	"clickdown/internal/app"
 )
 
 func main() {

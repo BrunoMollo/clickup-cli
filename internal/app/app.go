@@ -1,16 +1,20 @@
 package app
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"errors"
 	"flag"
 	"os"
+	"path/filepath"
 
-	"botty/internal/browser"
-	"botty/internal/clickup"
-	"botty/internal/config"
-	"botty/internal/sprint"
-	"botty/internal/tasks"
-	"botty/internal/tui"
+	"clickdown/internal/browser"
+	"clickdown/internal/clickup"
+	"clickdown/internal/config"
+	"clickdown/internal/sprint"
+	"clickdown/internal/tasks"
+	"clickdown/internal/tui"
+	"clickdown/internal/urlcache"
 )
 
 func Run() error {
@@ -22,9 +26,20 @@ func Run() error {
 		return err
 	}
 
-	client := clickup.NewClient(settings.Token)
+	cacheRoot, err := os.UserCacheDir()
+	if err != nil {
+		return err
+	}
+	fingerprint := sha256.Sum256([]byte(settings.Token))
+	cacheDir := filepath.Join(cacheRoot, "clickdown", "clickup", hex.EncodeToString(fingerprint[:8]))
+	responseCache, err := urlcache.New(cacheDir)
+	if err != nil {
+		return err
+	}
+
+	client := clickup.NewCachedClient(settings.Token, responseCache)
 	resolver := sprint.NewDateResolver(client)
 	loader := tasks.NewService(resolver, client, settings.AnchorView)
-	model := tui.NewModel(loader, browser.NewSystemOpener(), settings.IncludeClosed)
+	model := tui.NewModel(loader, browser.NewSystemOpener(), settings.IncludeClosed, client)
 	return tui.Run(model)
 }

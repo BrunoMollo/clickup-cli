@@ -8,7 +8,7 @@ import (
 	"strings"
 	"time"
 
-	"botty/internal/clickup"
+	"clickdown/internal/clickup"
 )
 
 type DateResolver struct {
