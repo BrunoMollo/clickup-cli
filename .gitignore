@@ -1,0 +1,5 @@
+/bin/
+/botty
+*.log
+.env
+.DS_Store
